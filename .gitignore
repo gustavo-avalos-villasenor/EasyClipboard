@@ -1,0 +1,7 @@
+# Lista blanca: solo se versiona el código. panel-data/ contiene el historial (sin cifrar) y nunca debe subirse.
+*
+!.gitignore
+!panel.cs
+!README.md
+!build.cmd
+!iniciar.cmd
