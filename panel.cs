@@ -292,7 +292,7 @@ internal sealed class ClipPanel : Form {
   const int VK_V = 0x56, VK_LWIN = 0x5B, VK_RWIN = 0x5C, VK_SHIFT = 0x10, VK_CONTROL = 0x11, VK_MENU = 0x12, VK_MASK = 0xE8;
   const int MAX_ITEMS = 25, MAX_TEXT = 4 * 1024 * 1024, MAX_HTML = 1024 * 1024;
   public const string WindowTitle = "CodexClipboardPanel";
-  const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", RunName = "CodexClipboardPanel";
+  const string RunKey = @"Software\Microsoft\Windows\CurrentVersion\Run", RunName = "EasyClipboard", OldRunName = "CodexClipboardPanel";
   public static readonly int WM_SHOWPANEL = Native.RegisterWindowMessage("CodexClipboardPanel.Show");
   static readonly string Root = AppDomain.CurrentDomain.BaseDirectory;
   static readonly string Store = Path.Combine(Root, "panel-data");
@@ -414,13 +414,14 @@ internal sealed class ClipPanel : Form {
   }
 
   bool IsAutostart() {
-    try { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && k.GetValue(RunName) != null; } catch { return false; }
+    try { using (var k = Registry.CurrentUser.OpenSubKey(RunKey)) return k != null && (k.GetValue(RunName) != null || k.GetValue(OldRunName) != null); } catch { return false; }
   }
   void SetAutostart(bool on) {
     try {
       using (var k = Registry.CurrentUser.CreateSubKey(RunKey)) {
         if (on) k.SetValue(RunName, "\"" + Application.ExecutablePath + "\" --background");
         else k.DeleteValue(RunName, false);
+        k.DeleteValue(OldRunName, false); // nombre de versiones anteriores
       }
     } catch (Exception ex) { Log("autostart", ex); Notify("No se pudo cambiar el inicio automático."); }
   }
