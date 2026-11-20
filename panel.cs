@@ -29,6 +29,7 @@ internal class ClipItem {
   public bool pinned { get; set; }
   public long time { get; set; }
   public int order { get; set; }
+  public long modified { get; set; } // último cambio de un fijado (para sincronizar)
 }
 
 internal static class Native {
@@ -285,7 +286,7 @@ internal sealed class ClipList : Control {
   }
 }
 
-internal sealed class ClipPanel : Form {
+internal sealed partial class ClipPanel : Form {
   const int WM_CLIPBOARDUPDATE = 0x031D, WM_QUIT = 0x12, WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
   const int WM_KEYDOWN = 0x100, WM_KEYUP = 0x101, WM_SYSKEYDOWN = 0x104, WM_SYSKEYUP = 0x105;
   const int WM_LBUTTONDOWN = 0x201, WM_RBUTTONDOWN = 0x204, WM_MBUTTONDOWN = 0x207, WM_XBUTTONDOWN = 0x20B;
@@ -338,6 +339,7 @@ internal sealed class ClipPanel : Form {
     Deactivate += (s, e) => HidePanel();
     Paint += (s, e) => { e.Graphics.SmoothingMode = SmoothingMode.AntiAlias; using (var path = Theme.Round(new Rectangle(0, 0, Width - 1, Height - 1), 12)) using (var p = new Pen(Theme.Border)) e.Graphics.DrawPath(p, path); };
     BuildTray();
+    InitSync();
     RefreshList(null);
   }
 
@@ -393,6 +395,7 @@ internal sealed class ClipPanel : Form {
     auto.Click += (s, e) => { SetAutostart(!IsAutostart()); auto.Checked = IsAutostart(); };
     menu.Items.Add(auto);
     menu.Items.Add("Abrir carpeta de datos", null, (s, e) => { try { System.Diagnostics.Process.Start("explorer.exe", "\"" + Store + "\""); } catch { } });
+    AddSyncMenu(menu);
     menu.Items.Add(new ToolStripSeparator());
     menu.Items.Add("Salir", null, (s, e) => Close());
     menu.Opening += (s, e) => auto.Checked = IsAutostart();
@@ -486,6 +489,7 @@ internal sealed class ClipPanel : Form {
       File.WriteAllText(tmp, json, new UTF8Encoding(false));
       if (File.Exists(Manifest)) File.Replace(tmp, Manifest, Manifest + ".bak", true); else File.Move(tmp, Manifest);
       dirty = false; saveTimer.Interval = 500;
+      AfterSave();
     } catch (Exception ex) { Log("save", ex); saveTimer.Interval = 3000; saveTimer.Start(); }
   }
 
@@ -710,7 +714,7 @@ internal sealed class ClipPanel : Form {
         // Quitar el fijado pide un segundo clic para confirmar.
         if (it.pinned && list.PendingUnpin != it) { list.PendingUnpin = it; list.PendingDelete = null; deleteTimer.Stop(); deleteTimer.Start(); list.Invalidate(); break; }
         list.PendingUnpin = null;
-        it.pinned = !it.pinned; if (it.pinned) it.order = MinOrder() - 1; else it.time = DateTimeOffset.Now.ToUnixTimeMilliseconds(); MarkDirty(); RefreshList(it); break;
+        it.pinned = !it.pinned; if (it.pinned) { it.order = MinOrder() - 1; it.modified = NowMs(); } else it.time = NowMs(); MarkDirty(); RefreshList(it); break;
       case Part.Delete:
         if (it.pinned && list.PendingDelete != it) { list.PendingDelete = it; list.PendingUnpin = null; deleteTimer.Stop(); deleteTimer.Start(); list.Invalidate(); break; }
         list.PendingDelete = null; RemoveItem(it); MarkDirty(); RefreshList(null); break;
@@ -723,9 +727,10 @@ internal sealed class ClipPanel : Form {
     if (index < 0 || target < 0 || target >= rows.Count || !it.pinned || !rows[target].pinned) return;
     var other = rows[target];
     if (other.order == it.order) { // órdenes repetidos: renumerar el grupo antes de intercambiar
-      int n = 0; foreach (var x in items.Where(x => x.pinned == it.pinned).OrderBy(x => x.order).ThenByDescending(x => x.time)) x.order = n++;
+      int n = 0; long now = NowMs(); foreach (var x in items.Where(x => x.pinned == it.pinned).OrderBy(x => x.order).ThenByDescending(x => x.time)) { x.order = n++; x.modified = now; }
     }
     int old = it.order; it.order = other.order; other.order = old;
+    it.modified = other.modified = NowMs();
     MarkDirty(); RefreshList(it);
     // Con el ratón, desplazar la lista para que la tarjeta siga bajo el cursor.
     if (byMouse) list.ScrollBy(step * ClipList.Stride); else list.EnsureVisible(list.Selected);
@@ -771,7 +776,7 @@ internal sealed class ClipPanel : Form {
     editor = null; editingItem = null; editPanel = null;
     if (save && it != null) {
       var text = ed.Text;
-      if (!String.IsNullOrWhiteSpace(text) && text != it.text) { it.text = text; it.html = null; MarkDirty(); } // el HTML original ya no coincidiría
+      if (!String.IsNullOrWhiteSpace(text) && text != it.text) { it.text = text; it.html = null; if (it.pinned) it.modified = NowMs(); MarkDirty(); } // el HTML original ya no coincidiría
     }
     Controls.Remove(panel); panel.Dispose();
     RefreshList(it);
@@ -960,6 +965,7 @@ internal sealed class ClipPanel : Form {
   }
 
   protected override void OnFormClosed(FormClosedEventArgs e) {
+    StopSync();
     SaveNow();
     Native.RemoveClipboardFormatListener(Handle);
     if (hookThreadId != 0) Native.PostThreadMessage(hookThreadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);

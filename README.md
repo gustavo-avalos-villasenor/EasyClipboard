@@ -91,14 +91,22 @@ reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v EasyClipboard
 - **Se guarda sin cifrar.** No fijes contraseñas ni tokens; si se colaron, bórralos desde el panel en modo edición.
 - Para hacer una copia de seguridad, copia la carpeta `panel-data\` completa con el programa cerrado.
 
-## 8. Desactivar o desinstalar
+## 8. Sincronización en la nube (opcional)
+
+Sincroniza los **fijados de texto e imagen** entre tus equipos a través de un servidor propio (ClipboardSecretServer), accesible solo por Tailscale. El contenido se cifra en el equipo antes de enviarse. El servidor solo guarda un blob opaco, y el portapapeles sigue funcionando igual sin conexión.
+
+Configúralo desde el icono de la bandeja → **«Sincronización en la nube…»**: URL del servidor, un token por equipo y la misma clave de cifrado en todos.
+
+La guía completa está en **[SYNC.md](SYNC.md)**: funcionamiento, seguridad, configuración de cada equipo, API y despliegue del servidor con systemd, y problemas frecuentes.
+
+## 9. Desactivar o desinstalar
 
 1. Icono de la bandeja → desactiva **«Iniciar con Windows»** → **Salir**. Win+V vuelve a abrir el panel de Windows.
 2. Para desinstalarlo, borra la carpeta `%LOCALAPPDATA%\EasyClipboard`, incluido `panel-data\` si no quieres conservar el historial.
 
 No se modifica nada más del sistema: ni servicios, ni `DisabledHotkeys`, ni los datos del portapapeles de Windows.
 
-## 9. Problemas frecuentes
+## 10. Problemas frecuentes
 
 | Síntoma | Causa y solución |
 | --- | --- |
@@ -110,7 +118,7 @@ No se modifica nada más del sistema: ni servicios, ni `DisabledHotkeys`, ni los
 | `build.cmd` falla | Comprueba que existe `%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe` y que `panel.exe` no está abierto |
 | Algo falla sin mensaje | Revisa `panel-data\errors.log` |
 
-## 10. Notas técnicas
+## 11. Notas técnicas
 
 - `AddClipboardFormatListener` detecta cada copia. Se procesa 120 ms después del último cambio, para agrupar ráfagas.
 - Win+V se intercepta con `WH_KEYBOARD_LL` en un hilo propio, para no frenar el teclado del sistema. Se envía una tecla neutra (`0xE8`) para que soltar `Win` no abra Inicio.
