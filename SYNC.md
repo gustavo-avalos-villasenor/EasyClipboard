@@ -62,6 +62,22 @@ Formato del blob: `"ECS1"` (4 bytes) · IV (16) · texto cifrado · HMAC (32).
 
 Haz lo mismo con su propio token, pero **pega la clave existente**. No generes una nueva.
 
+**Exportar e importar (como un `.conf` de WireGuard)**
+
+- **«Exportar…»** guarda la URL, el token y la clave en un archivo de texto `.ecsync`:
+
+  ```ini
+  # EasyClipboard: sincronización en la nube
+  [EasyClipboard]
+  Server = https://<servidor>.<tailnet>.ts.net:1445
+  Token = <token>
+  Key = <clave en Base64>
+  ```
+
+- **«Importar…»** carga ese archivo en el diálogo. Revisa los datos y pulsa **Guardar**.
+- El archivo lleva los secretos **sin cifrar**. Pásalo por un canal seguro, bórralo tras importarlo y nunca lo subas a un repositorio.
+- Si importas el archivo de otro equipo, ambos compartirán token. Funciona, pero conviene sustituirlo por uno propio para poder revocarlos por separado.
+
 **Desactivar:** usa el botón **«Desactivar»** del mismo diálogo. Borra la configuración del Administrador de credenciales; los fijados locales se quedan.
 
 ## 4. Servidor (ClipboardSecretServer)

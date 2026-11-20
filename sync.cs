@@ -516,18 +516,12 @@ internal sealed class SyncDialog : Form {
     };
     var copy = Button("Copiar clave", 184, y, 120); copy.Click += (s, e) => CopySecret(key.Text.Trim());
     var show = Button("Mostrar", 312, y, 80); show.Click += (s, e) => { bool hide = !key.UseSystemPasswordChar; key.UseSystemPasswordChar = hide; token.UseSystemPasswordChar = hide; show.Text = hide ? "Mostrar" : "Ocultar"; };
+    var import = Button("Importar…", 400, y, 104); import.Click += (s, e) => ImportFile();
     y += 44;
     Controls.Add(new Label { Text = "Estado: " + status, Location = new Point(16, y), Size = new Size(488, 40), ForeColor = Theme.Muted });
     var save = Button("Guardar", 404, 324, 100); save.BackColor = Theme.Accent; save.ForeColor = Color.White;
-    save.Click += (s, e) => {
-      var u = url.Text.Trim();
-      Uri parsed;
-      if (!Uri.TryCreate(u, UriKind.Absolute, out parsed) || parsed.Scheme != "https") { Warn("La URL debe empezar por https://"); return; }
-      if (token.Text.Trim().Length == 0) { Warn("Falta el token del dispositivo."); return; }
-      try { SyncCrypto.ParseKey(key.Text); } catch (SyncException ex) { Warn(ex.Message); return; }
-      Result = new SyncConfig { url = u.TrimEnd('/'), token = token.Text.Trim(), key = key.Text.Trim() };
-      DialogResult = DialogResult.OK;
-    };
+    save.Click += (s, e) => { var cfg = ReadFields(); if (cfg == null) return; Result = cfg; DialogResult = DialogResult.OK; };
+    var export = Button("Exportar…", 134, 324, 100); export.Click += (s, e) => ExportFile();
     var cancel = Button("Cancelar", 296, 324, 100); cancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; };
     if (current != null) {
       var off = Button("Desactivar", 16, 324, 110); off.ForeColor = Theme.Danger;
@@ -552,6 +546,39 @@ internal sealed class SyncDialog : Form {
 
   void Warn(string message) { MessageBox.Show(this, message, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning); }
 
+  SyncConfig ReadFields() {
+    var u = url.Text.Trim();
+    Uri parsed;
+    if (!Uri.TryCreate(u, UriKind.Absolute, out parsed) || parsed.Scheme != "https") { Warn("La URL debe empezar por https://"); return null; }
+    if (token.Text.Trim().Length == 0) { Warn("Falta el token del dispositivo."); return null; }
+    try { SyncCrypto.ParseKey(key.Text); } catch (SyncException ex) { Warn(ex.Message); return null; }
+    return new SyncConfig { url = u.TrimEnd('/'), token = token.Text.Trim(), key = key.Text.Trim() };
+  }
+
+  const string FileFilter = "Configuración de EasyClipboard (*.ecsync)|*.ecsync|Todos los archivos (*.*)|*.*";
+
+  void ExportFile() {
+    var cfg = ReadFields(); if (cfg == null) return;
+    if (MessageBox.Show(this, "El archivo contiene el token y la clave sin cifrar: quien lo tenga puede leer y modificar tus fijados.\n\nGuárdalo en un lugar seguro y bórralo tras importarlo en el otro equipo. ¿Continuar?", Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+    using (var dlg = new SaveFileDialog { Filter = FileFilter, FileName = "easyclipboard-" + Environment.MachineName.ToLowerInvariant() + ".ecsync", OverwritePrompt = true }) {
+      if (dlg.ShowDialog(this) != DialogResult.OK) return;
+      try { File.WriteAllText(dlg.FileName, SyncFile.Format(cfg), new UTF8Encoding(false)); }
+      catch (Exception ex) { Warn("No se pudo guardar: " + ex.Message); }
+    }
+  }
+
+  void ImportFile() {
+    using (var dlg = new OpenFileDialog { Filter = FileFilter }) {
+      if (dlg.ShowDialog(this) != DialogResult.OK) return;
+      try {
+        var cfg = SyncFile.Parse(File.ReadAllText(dlg.FileName, Encoding.UTF8));
+        url.Text = cfg.url; token.Text = cfg.token; key.Text = cfg.key;
+        MessageBox.Show(this, "Configuración cargada. Revisa los datos y pulsa Guardar.\n\nSi el token es de otro equipo, conviene pedir uno propio para poder revocarlos por separado.", Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
+      } catch (Exception ex) { Warn("No se pudo importar: " + ex.Message); }
+    }
+  }
+
+
   // Copia la clave pidiendo a los historiales (este panel y el de Windows) que no la guarden.
   void CopySecret(string value) {
     if (value.Length == 0) return;
@@ -563,5 +590,34 @@ internal sealed class SyncDialog : Form {
       data.SetData("CanUploadToCloudClipboard", new MemoryStream(new byte[4]));
       Clipboard.SetDataObject(data, true, 10, 50);
     } catch (Exception ex) { Warn("No se pudo copiar: " + ex.Message); }
+  }
+}
+
+// Archivo de configuración legible, al estilo de un .conf de WireGuard.
+internal static class SyncFile {
+  public static string Format(SyncConfig cfg) {
+    return "# EasyClipboard: sincronización en la nube\n"
+      + "# Contiene secretos sin cifrar. No lo compartas ni lo subas a ningún repositorio.\n"
+      + "[EasyClipboard]\n"
+      + "Server = " + cfg.url + "\n"
+      + "Token = " + cfg.token + "\n"
+      + "Key = " + cfg.key + "\n";
+  }
+
+  public static SyncConfig Parse(string text) {
+    var cfg = new SyncConfig();
+    foreach (var raw in (text ?? "").Split('\n')) {
+      var line = raw.Trim();
+      if (line.Length == 0 || line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
+      int eq = line.IndexOf('=');
+      if (eq <= 0) continue;
+      var name = line.Substring(0, eq).Trim().ToLowerInvariant(); var value = line.Substring(eq + 1).Trim();
+      if (name == "server" || name == "url") cfg.url = value;
+      else if (name == "token") cfg.token = value;
+      else if (name == "key") cfg.key = value;
+    }
+    if (String.IsNullOrEmpty(cfg.url) || String.IsNullOrEmpty(cfg.token) || String.IsNullOrEmpty(cfg.key)) throw new SyncException("Al archivo le falta Server, Token o Key.");
+    SyncCrypto.ParseKey(cfg.key);
+    return cfg;
   }
 }
