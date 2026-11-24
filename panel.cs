@@ -72,6 +72,10 @@ internal static class Native {
   [DllImport("user32.dll")] public static extern bool PeekMessage(out MSG msg, IntPtr hwnd, uint min, uint max, uint remove);
   [DllImport("user32.dll")] public static extern bool TranslateMessage(ref MSG msg);
   [DllImport("user32.dll")] public static extern IntPtr DispatchMessage(ref MSG msg);
+  [DllImport("user32.dll")] public static extern UIntPtr SetTimer(IntPtr hwnd, UIntPtr id, uint ms, IntPtr proc);
+  [StructLayout(LayoutKind.Sequential)] public struct LASTINPUTINFO { public int cbSize; public uint dwTime; }
+  [DllImport("user32.dll")] public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+  public static uint LastInputTick() { var li = new LASTINPUTINFO { cbSize = 8 }; return GetLastInputInfo(ref li) ? li.dwTime : 0; }
 
   public static INPUT Key(ushort vk, bool up) {
     return new INPUT { type = 1, u = new InputUnion { ki = new KEYBDINPUT { vk = vk, flags = up ? 2u : 0u } } };
@@ -314,6 +318,7 @@ internal sealed partial class ClipPanel : Form {
   readonly object boundsLock = new object();
   Rectangle panelBounds;
   volatile bool panelVisible, suppressV;
+  int lastHookTick; // Environment.TickCount de la última llamada a cualquiera de los ganchos
   IntPtr keyHook, mouseHook, previousWindow;
   uint hookThreadId, ownSequence, lastSequence;
   bool dirty;
@@ -433,7 +438,11 @@ internal sealed partial class ClipPanel : Form {
   public static void Log(string where, Exception ex) {
     try { File.AppendAllText(Path.Combine(Store, "errors.log"), DateTime.Now.ToString("s") + " [" + where + "] " + ex + Environment.NewLine + Environment.NewLine); } catch { }
   }
+  public static void LogLine(string where, string message) {
+    try { File.AppendAllText(Path.Combine(Store, "errors.log"), DateTime.Now.ToString("s") + " [" + where + "] " + message + Environment.NewLine); } catch { }
+  }
   void Notify(string message) { try { tray.ShowBalloonTip(3000, "Portapapeles", message, ToolTipIcon.Warning); } catch { } }
+  void Info(string message) { try { tray.ShowBalloonTip(3000, "Portapapeles", message, ToolTipIcon.Info); } catch { } }
 
   static bool TryLoad(string path, out List<ClipItem> data) {
     data = null;
@@ -899,17 +908,40 @@ internal sealed partial class ClipPanel : Form {
   }
 
   // ---------- Ganchos (en su propio hilo para no frenar el teclado del sistema) ----------
+  // Windows quita en silencio un gancho de bajo nivel si alguna vez tarda demasiado en responder
+  // (por ejemplo, durante una pausa del recolector de basura). Sin él, Win+V abre el panel de Windows.
+  // Cada 2 s se comprueba si ha habido entrada que los ganchos no vieron y, en ese caso, se reinstalan.
+  const uint WM_TIMER = 0x113, WM_MASKWIN = 0x8001;
+  void InstallHooks() {
+    var module = Native.GetModuleHandle(null);
+    IntPtr oldKey = keyHook, oldMouse = mouseHook;
+    var k = Native.SetWindowsHookEx(WH_KEYBOARD_LL, keyProc, module, 0);
+    var m = Native.SetWindowsHookEx(WH_MOUSE_LL, mouseProc, module, 0);
+    if (k != IntPtr.Zero) { keyHook = k; if (oldKey != IntPtr.Zero) Native.UnhookWindowsHookEx(oldKey); }
+    if (m != IntPtr.Zero) { mouseHook = m; if (oldMouse != IntPtr.Zero) Native.UnhookWindowsHookEx(oldMouse); }
+    lastHookTick = Environment.TickCount;
+  }
+  void CheckHooks() {
+    uint input = Native.LastInputTick();
+    // Hubo entrada posterior (con 1 s de margen) a la última llamada de los ganchos: Windows los quitó.
+    if (input != 0 && unchecked((int)input - lastHookTick) > 1000) InstallHooks();
+  }
+
   void StartHooks() {
     var ready = new ManualResetEvent(false);
     var thread = new Thread(() => {
       hookThreadId = Native.GetCurrentThreadId();
-      var module = Native.GetModuleHandle(null);
-      keyHook = Native.SetWindowsHookEx(WH_KEYBOARD_LL, keyProc, module, 0);
-      mouseHook = Native.SetWindowsHookEx(WH_MOUSE_LL, mouseProc, module, 0);
+      InstallHooks();
       Native.MSG msg;
       Native.PeekMessage(out msg, IntPtr.Zero, 0, 0, 0); // crea la cola de mensajes del hilo
+      Native.SetTimer(IntPtr.Zero, UIntPtr.Zero, 2000, IntPtr.Zero);
       ready.Set();
-      while (Native.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) { Native.TranslateMessage(ref msg); Native.DispatchMessage(ref msg); }
+      while (Native.GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+        if (msg.hwnd == IntPtr.Zero && msg.message == WM_TIMER) { CheckHooks(); continue; }
+        // Una tecla neutra entre Win y su liberación evita que se abra Inicio. Se envía fuera del gancho para que este responda al instante.
+        if (msg.hwnd == IntPtr.Zero && msg.message == WM_MASKWIN) { Native.Send(Native.Key(VK_MASK, false), Native.Key(VK_MASK, true)); continue; }
+        Native.TranslateMessage(ref msg); Native.DispatchMessage(ref msg);
+      }
       if (keyHook != IntPtr.Zero) Native.UnhookWindowsHookEx(keyHook);
       if (mouseHook != IntPtr.Zero) Native.UnhookWindowsHookEx(mouseHook);
     });
@@ -922,14 +954,14 @@ internal sealed partial class ClipPanel : Form {
   void PostToUi(Action action) { try { if (IsHandleCreated) BeginInvoke(action); } catch (InvalidOperationException) { } }
 
   IntPtr KeyboardHook(int nCode, IntPtr wParam, IntPtr lParam) {
+    lastHookTick = Environment.TickCount;
     if (nCode >= 0 && Marshal.ReadInt32(lParam) == VK_V) {
       int msg = wParam.ToInt32();
       bool down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN, up = msg == WM_KEYUP || msg == WM_SYSKEYUP;
       if (down && suppressV) return (IntPtr)1; // repetición de tecla
       if (down && (Native.Down(VK_LWIN) || Native.Down(VK_RWIN)) && !Native.Down(VK_SHIFT) && !Native.Down(VK_CONTROL) && !Native.Down(VK_MENU)) {
         suppressV = true;
-        // Una tecla neutra entre Win y su liberación evita que se abra Inicio.
-        Native.Send(Native.Key(VK_MASK, false), Native.Key(VK_MASK, true));
+        Native.PostThreadMessage(hookThreadId, WM_MASKWIN, IntPtr.Zero, IntPtr.Zero);
         PostToUi(TogglePanel);
         return (IntPtr)1;
       }
@@ -939,6 +971,7 @@ internal sealed partial class ClipPanel : Form {
   }
 
   IntPtr MouseHook(int nCode, IntPtr wParam, IntPtr lParam) {
+    lastHookTick = Environment.TickCount;
     if (nCode >= 0 && panelVisible) {
       int msg = wParam.ToInt32();
       if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN) {
@@ -981,6 +1014,8 @@ internal sealed partial class ClipPanel : Form {
         if (existing != IntPtr.Zero) { Native.AllowSetForegroundWindow(-1); Native.PostMessage(existing, (uint)WM_SHOWPANEL, IntPtr.Zero, IntPtr.Zero); }
         return;
       }
+      // Menos pausas largas del recolector: una pausa que bloquee el hilo de los ganchos hace que Windows los quite.
+      System.Runtime.GCSettings.LatencyMode = System.Runtime.GCLatencyMode.SustainedLowLatency;
       Application.EnableVisualStyles();
       Application.SetCompatibleTextRenderingDefault(false);
       Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);

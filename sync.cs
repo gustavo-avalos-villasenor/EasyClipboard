@@ -53,6 +53,7 @@ internal sealed class SyncOutcome {
   public bool Unchanged;
   public SyncDoc Doc;
   public string ETag;
+  public int Dropped; // imágenes fijadas que no caben en el blob y no se sincronizan
 }
 
 // ---------- Administrador de credenciales de Windows ----------
@@ -258,16 +259,30 @@ internal static class SyncEngine {
       else throw Unexpected(get, "Al descargar");
 
       var merged = Merge(local.Select(Clone).ToList(), remote, baseIds, now);
-      if (etag != null && Signature(merged) == Signature(remote)) return new SyncOutcome { Doc = merged, ETag = etag };
+      int dropped; var body = Fit(key, merged, out dropped);
+      if (etag != null && Signature(merged) == Signature(remote)) return new SyncOutcome { Doc = merged, ETag = etag, Dropped = dropped };
 
-      var body = Seal(key, merged);
-      if (body.Length > MaxBlob) throw new SyncException("Los fijados ocupan más de 5 MiB cifrados; quita alguna imagen fijada.");
       var put = Send(cfg, "PUT", body, etag, etag == null ? "*" : null);
-      if (put.Status == 200 || put.Status == 201 || put.Status == 204) return new SyncOutcome { Doc = merged, ETag = put.ETag };
+      if (put.Status == 200 || put.Status == 201 || put.Status == 204) return new SyncOutcome { Doc = merged, ETag = put.ETag, Dropped = dropped };
       if (put.Status == 412) { Thread.Sleep(200 * (attempt + 1)); continue; } // otro equipo escribió antes: volver a fusionar
       throw Unexpected(put, "Al subir");
     }
     throw new SyncException("Otro equipo está escribiendo a la vez; se reintentará.");
+  }
+
+  // Si el blob no cabe en el servidor, se dejan fuera las imágenes más antiguas en vez de bloquear
+  // toda la sincronización. El orden es determinista para que todos los equipos descarten las mismas.
+  static byte[] Fit(byte[] key, SyncDoc doc, out int dropped) {
+    dropped = 0;
+    var body = Seal(key, doc);
+    if (body.Length <= MaxBlob) return body;
+    var images = doc.items.Where(x => x.kind == "image").OrderBy(x => x.modified).ThenBy(x => x.id, StringComparer.Ordinal).ToList();
+    foreach (var img in images) {
+      doc.items.Remove(img); dropped++;
+      body = Seal(key, doc);
+      if (body.Length <= MaxBlob) return body;
+    }
+    throw new SyncException("Los fijados de texto ocupan más de 5 MiB cifrados; quita alguno.");
   }
 
   static SyncItem Clone(SyncItem x) {
@@ -281,7 +296,8 @@ internal sealed partial class ClipPanel {
   SyncConfig syncCfg;
   byte[] syncKey;
   SyncState syncState = new SyncState();
-  bool syncRunning, syncPending, syncFailing;
+  bool syncRunning, syncPending, syncFailing, syncManual;
+  int syncDroppedShown = -1;
   string syncStatus = "Desactivada";
   readonly WinTimer syncDebounce = new WinTimer { Interval = 1500 };
   readonly WinTimer syncPoll = new WinTimer { Interval = 10 * 60 * 1000 };
@@ -293,6 +309,7 @@ internal sealed partial class ClipPanel {
 
   void InitSync() {
     ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072; // TLS 1.2
+    ServicePointManager.DefaultConnectionLimit = Math.Max(ServicePointManager.DefaultConnectionLimit, 8); // el canal SSE ocupa una conexión fija
     syncDebounce.Tick += (s, e) => { syncDebounce.Stop(); StartSync(); };
     syncPoll.Tick += (s, e) => StartSync();
     try {
@@ -306,9 +323,11 @@ internal sealed partial class ClipPanel {
 
   void AddSyncMenu(ContextMenuStrip menu) {
     menu.Items.Add("Sincronización en la nube…", null, (s, e) => ShowSyncDialog());
-    var now = new ToolStripMenuItem("Sincronizar ahora", null, (s, e) => StartSync());
+    var now = new ToolStripMenuItem("Sincronizar ahora", null, (s, e) => { syncManual = true; StartSync(); });
     menu.Items.Add(now);
-    menu.Opening += (s, e) => { now.Enabled = syncCfg != null; now.ToolTipText = syncStatus; };
+    var status = new ToolStripMenuItem { Enabled = false };
+    menu.Items.Add(status);
+    menu.Opening += (s, e) => { now.Enabled = syncCfg != null; status.Text = "Sincronización: " + syncStatus; };
   }
 
   void SaveSyncState() {
@@ -387,16 +406,23 @@ internal sealed partial class ClipPanel {
   void FinishSync(int gen, SyncOutcome res, Exception err) {
     syncRunning = false;
     if (gen != syncGeneration || closing) { if (syncPending && syncCfg != null) SyncSoon(300); return; }
+    bool manual = syncManual; syncManual = false;
     if (err != null) {
-      if (!(err is SyncException)) Log("sync", err);
+      if (err is SyncException) LogLine("sync", err.Message); else Log("sync", err);
       syncStatus = "Error: " + err.Message;
-      if (!syncFailing) Notify("Sincronización: " + err.Message);
+      if (!syncFailing || manual) Notify("Sincronización: " + err.Message);
       syncFailing = true;
     } else {
       if (!res.Unchanged) ApplySync(res.Doc, res.ETag);
-      if (syncFailing) Notify("La sincronización vuelve a funcionar.");
+      int dropped = res.Unchanged ? Math.Max(syncDroppedShown, 0) : res.Dropped;
+      int big = items.Count(x => x.pinned && x.kind == "image" && !Syncable(x));
+      string note = dropped + big == 0 ? "" : " (" + (dropped + big) + " imagen(es) no caben y no se sincronizan)";
+      syncStatus = "Sincronizado a las " + DateTime.Now.ToString("HH:mm") + note;
+      if (syncFailing) Notify("La sincronización vuelve a funcionar." + note);
+      else if (manual) Info(syncStatus + ".");
+      else if (dropped + big != syncDroppedShown && dropped + big > 0) Notify("Sincronización:" + note + ". Límite: 2 MB por imagen y 5 MiB en total.");
+      syncDroppedShown = dropped + big;
       syncFailing = false;
-      syncStatus = "Sincronizado a las " + DateTime.Now.ToString("HH:mm");
     }
     if (syncPending) SyncSoon(300);
   }
@@ -484,6 +510,7 @@ internal sealed partial class ClipPanel {
   void ShowSyncDialog() {
     using (var dlg = new SyncDialog(syncCfg, syncStatus)) {
       if (dlg.ShowDialog() != DialogResult.OK) return;
+      syncManual = true; // mostrar el resultado de la primera sincronización
       try {
         if (dlg.Result == null) { CredStore.Delete(); UseSyncConfig(null); return; }
         SyncCrypto.ParseKey(dlg.Result.key);

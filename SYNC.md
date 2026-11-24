@@ -146,7 +146,8 @@ sudo tailscale serve --bg --https=1445 http://127.0.0.1:18767
 | «El servidor rechazó el token del dispositivo» | El token se revocó o se copió mal. Crea otro con `token create` y vuelve a pegarlo en el diálogo. |
 | «La clave de cifrado no coincide con la de tus otros equipos» | Este equipo tiene otra clave. Pega la clave original; no generes una nueva. |
 | «Sin conexión con el servidor» | El equipo no está en la tailnet, o el servicio está caído. Comprueba `https://<servidor>:1445/health` y, en el host, `systemctl status clipboard-secret-server` y `journalctl -u clipboard-secret-server -n 40`. |
-| «Los fijados ocupan más de 5 MiB cifrados» | Hay demasiadas imágenes fijadas. Quita alguna. |
+| «N imagen(es) no caben y no se sincronizan» | Una imagen de más de 2 MB no se sincroniza, y si el total supera 5 MiB cifrados se dejan fuera las imágenes más antiguas. El texto se sigue sincronizando. Quita imágenes fijadas grandes si las necesitas en otros equipos. |
+| No sé si sincroniza | Clic derecho en la bandeja: la línea «Sincronización: …» muestra el último resultado. «Sincronizar ahora» siempre avisa del resultado. Los errores se anotan en `panel-data\errors.log`. |
 | `curl` a `127.0.0.1:18767` falla justo después de `systemctl restart` | El servicio aún está arrancando. Usa `--retry 20 --retry-connrefused`. |
 | `token create` (o cualquier comando) no muestra nada en la terminal | La salida estándar de esa sesión quedó redirigida (por ejemplo, por un heredoc pegado a medias). Comprueba con `echo hola`; se arregla con `exec 1>/dev/tty 2>/dev/tty` o abriendo una sesión nueva. |
 | Los cambios tardan en llegar a otro equipo | El canal SSE se está reconectando. Como mucho llegan en 10 minutos; usa «Sincronizar ahora» para forzarlo. |

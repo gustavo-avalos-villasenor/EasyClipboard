@@ -111,6 +111,7 @@ No se modifica nada más del sistema: ni servicios, ni `DisabledHotkeys`, ni los
 | Síntoma | Causa y solución |
 | --- | --- |
 | Win+V abre el panel de Windows | EasyClipboard no está en marcha (`tasklist /FI "IMAGENAME eq panel.exe"`); arráncalo. Si al iniciar avisó «No se pudo interceptar Win+V», reinícialo |
+| Win+V abre el de Windows solo a veces | Si la ventana activa se ejecuta **como administrador** (Administrador de tareas, una terminal elevada…), Windows no deja que un programa normal vea sus teclas. Pulsa Win+V desde otra ventana o usa el icono de la bandeja. Si Windows quita el gancho por un bloqueo puntual, EasyClipboard lo reinstala solo en unos 2 s |
 | No pega en una ventana | Esa ventana se ejecuta como administrador y Windows bloquea el pegado automático. El contenido ya está en el portapapeles: pulsa `Ctrl+V` |
 | Se abre el menú Inicio al soltar Win | Avísalo con la versión de Windows. Mientras tanto, suelta `V` antes que `Win` |
 | No aparece algo que copié | Venía de un gestor de contraseñas (se excluye a propósito), era texto de más de 4 MB, o era idéntico a uno existente (en ese caso sube arriba) |
@@ -121,6 +122,7 @@ No se modifica nada más del sistema: ni servicios, ni `DisabledHotkeys`, ni los
 ## 11. Notas técnicas
 
 - `AddClipboardFormatListener` detecta cada copia. Se procesa 120 ms después del último cambio, para agrupar ráfagas.
-- Win+V se intercepta con `WH_KEYBOARD_LL` en un hilo propio, para no frenar el teclado del sistema. Se envía una tecla neutra (`0xE8`) para que soltar `Win` no abra Inicio.
+- Win+V se intercepta con `WH_KEYBOARD_LL` en un hilo propio, para no frenar el teclado del sistema. Se envía una tecla neutra (`0xE8`), fuera del gancho, para que soltar `Win` no abra Inicio.
+- Windows quita en silencio un gancho que tarda demasiado (por ejemplo, durante una pausa del recolector). Cada 2 s se compara `GetLastInputInfo` con la última llamada a los ganchos y, si hubo entrada que no vieron, se reinstalan.
 - La lista se dibuja a mano y solo pinta las filas visibles.
 - Un mutex (`Local\CodexClipboardPanel`) impide que haya dos instancias. Si ejecutas `panel.exe` otra vez, se abre el panel de la instancia que ya está en marcha.
