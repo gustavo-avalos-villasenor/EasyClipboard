@@ -546,6 +546,7 @@ internal sealed partial class ClipPanel : Form {
         Prune();
       }
       MarkDirty(); RefreshList(null);
+      if (item.kind == "text") LiveCopied(item.text);
     } catch (Exception ex) { Log("store", ex); }
   }
 
@@ -842,6 +843,7 @@ internal sealed partial class ClipPanel : Form {
       }
       Clipboard.SetDataObject(data, true, 10, 50);
       ownSequence = Native.GetClipboardSequenceNumber();
+      if (it.kind == "text") LiveCopied(it.text);
       it.time = DateTimeOffset.Now.ToUnixTimeMilliseconds();
       MarkDirty();
       return true;

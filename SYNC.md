@@ -3,6 +3,7 @@
 EasyClipboard puede sincronizar los **elementos fijados** entre varios equipos Windows a través de **ClipboardSecretServer**, un servidor propio y pequeño que solo guarda un blob cifrado. El servidor nunca ve el contenido.
 
 - Se sincronizan los fijados de **texto** e **imagen** (hasta 2 MB por imagen). Los temporales y los fijados de tipo «archivos» (rutas locales) no salen del equipo.
+- Además, **lo último copiado** (texto) se comparte entre todos los equipos, incluido el móvil Android (ver §6).
 - El portapapeles funciona igual sin conexión; la sincronización es un añadido.
 
 ## 1. Cómo funciona
@@ -91,7 +92,9 @@ Es un servicio Python con SQLite en un host Linux de la tailnet. Escucha solo en
 | `GET /health` | `200 ok`. No requiere autenticación. |
 | `GET /v1/clipboard/blob` | Devuelve el blob (`application/octet-stream`) con `ETag`. `404` si aún no existe; `304` con `If-None-Match`. |
 | `PUT /v1/clipboard/blob` | Cuerpo binario. Exige `If-None-Match: *` (crear) o `If-Match: "<etag>"`; sin ninguno responde `428`. `412` si hay conflicto; `413` si supera 5 MiB. |
-| `GET /v1/clipboard/events` | SSE: `event: changed` / `data: "<etag>"` tras cada PUT, con un latido cada 25 s. |
+| `GET /v1/clipboard/live` | Lo último copiado: un único blob cifrado, sin historial. `404` si no existe; `304` con `If-None-Match`. |
+| `PUT /v1/clipboard/live` | Cuerpo binario. Gana el último en escribir (`If-Match` opcional; `412` si no coincide). `413` si supera 5 MiB. |
+| `GET /v1/clipboard/events` | SSE: `event: changed` (fijados) o `event: live` (lo último copiado) con `data: "<etag>"`, y un latido cada 25 s. Los clientes ignoran los eventos que no conocen. |
 
 Todas las rutas salvo `/health` requieren `Authorization: Bearer <token>` y responden `401` si falta o es inválido. Los tokens se guardan solo como hash SHA-256.
 
@@ -151,3 +154,19 @@ sudo tailscale serve --bg --https=1445 http://127.0.0.1:18767
 | `curl` a `127.0.0.1:18767` falla justo después de `systemctl restart` | El servicio aún está arrancando. Usa `--retry 20 --retry-connrefused`. |
 | `token create` (o cualquier comando) no muestra nada en la terminal | La salida estándar de esa sesión quedó redirigida (por ejemplo, por un heredoc pegado a medias). Comprueba con `echo hola`; se arregla con `exec 1>/dev/tty 2>/dev/tty` o abriendo una sesión nueva. |
 | Los cambios tardan en llegar a otro equipo | El canal SSE se está reconectando. Como mucho llegan en 10 minutos; usa «Sincronizar ahora» para forzarlo. |
+
+## 6. Lo último copiado y el móvil
+
+Cada texto que copias en un equipo (o eliges en el panel) se sube cifrado con la misma clave a `/v1/clipboard/live`, con el formato `{"v":1,"id","kind":"text","text","time","from"}`. Los demás equipos lo reciben por SSE (`event: live`) y lo ponen en su portapapeles, donde entra en el historial como cualquier copia. Se avisa con «Copiado desde <equipo>».
+
+- No se envía lo que excluyen los gestores de contraseñas, ni lo que acaba de llegar de otro equipo (se compara la huella SHA-256 del texto).
+- Al configurar un equipo nuevo no se aplica lo que ya hubiera en el servidor; solo lo que se copie después.
+- Se desactiva desde la bandeja: **«Compartir lo copiado con el móvil»** (crea `panel-data\live-off`).
+- Por ahora solo texto; las imágenes siguen sincronizándose como fijados.
+
+**App Android** (en el host: `/home/Pixel/easyclipboard/`, se compila e instala por ADB con `build.sh --install`):
+
+- **PC → móvil:** automático. Un servicio en primer plano mantiene el canal SSE y se reconecta al cambiar de red.
+- **Móvil → PC:** con un toque. Android (10+) solo deja leer el portapapeles a la app que tiene el foco: botón «Enviar al PC» de Ajustes rápidos, la acción de la notificación, el botón de la app o Compartir → «Enviar al PC». El contenido marcado como sensible no se envía.
+- Muestra los fijados de texto; tocar uno lo copia.
+- Configuración: URL, un token propio (`token create --name pixel`) y la **misma clave**; admite importar un `.ecsync`. Se guarda cifrada con el Android Keystore.

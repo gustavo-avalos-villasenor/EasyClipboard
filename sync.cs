@@ -45,6 +45,9 @@ internal class SyncState {
   public List<string> synced { get; set; }   // ids vivos tras la última sincronización correcta
   public string localSig { get; set; }       // firma de los fijados locales tras esa sincronización
   public string server { get; set; }         // url + huella de la clave a la que pertenece este estado
+  public string liveId { get; set; }         // último «copiado» enviado o recibido (/v1/clipboard/live)
+  public string liveHash { get; set; }       // SHA-256 de su texto, para no reenviar lo que acaba de llegar
+  public string liveEtag { get; set; }
 }
 
 internal sealed class SyncException : Exception { public SyncException(string message) : base(message) { } }
@@ -161,7 +164,7 @@ internal static class SyncCrypto {
 
 // ---------- Fusión y red (sin estado de UI; se ejecuta en segundo plano) ----------
 internal static class SyncEngine {
-  public const string BlobPath = "/v1/clipboard/blob", EventsPath = "/v1/clipboard/events";
+  public const string BlobPath = "/v1/clipboard/blob", EventsPath = "/v1/clipboard/events", LivePath = "/v1/clipboard/live";
   public const int MaxBlob = 5 * 1024 * 1024, MaxImage = 2 * 1024 * 1024;
   const long TombstoneTtl = 60L * 24 * 3600 * 1000;
 
@@ -219,8 +222,9 @@ internal static class SyncEngine {
     return r;
   }
 
-  static Resp Send(SyncConfig cfg, string method, byte[] body, string ifMatch, string ifNoneMatch) {
-    var r = Request(cfg, method, BlobPath);
+  static Resp Send(SyncConfig cfg, string method, byte[] body, string ifMatch, string ifNoneMatch) { return Send(cfg, method, BlobPath, body, ifMatch, ifNoneMatch); }
+  internal static Resp Send(SyncConfig cfg, string method, string path, byte[] body, string ifMatch, string ifNoneMatch) {
+    var r = Request(cfg, method, path);
     if (ifMatch != null) r.Headers[HttpRequestHeader.IfMatch] = ifMatch;
     if (ifNoneMatch != null) r.Headers[HttpRequestHeader.IfNoneMatch] = ifNoneMatch;
     if (body != null) {
@@ -240,7 +244,7 @@ internal static class SyncEngine {
     }
   }
 
-  static SyncException Unexpected(Resp r, string what) {
+  internal static SyncException Unexpected(Resp r, string what) {
     if (r.Status == 401 || r.Status == 403) return new SyncException("El servidor rechazó el token del dispositivo.");
     if (r.Status == 413) return new SyncException("Los fijados ocupan más de lo que admite el servidor (5 MiB cifrados).");
     if (r.Status == 429) return new SyncException("El servidor pidió esperar (demasiadas peticiones).");
@@ -312,6 +316,7 @@ internal sealed partial class ClipPanel {
     ServicePointManager.DefaultConnectionLimit = Math.Max(ServicePointManager.DefaultConnectionLimit, 8); // el canal SSE ocupa una conexión fija
     syncDebounce.Tick += (s, e) => { syncDebounce.Stop(); StartSync(); };
     syncPoll.Tick += (s, e) => StartSync();
+    liveDebounce.Tick += (s, e) => { liveDebounce.Stop(); StartLivePush(); };
     try {
       if (File.Exists(SyncStatePath)) syncState = new JavaScriptSerializer().Deserialize<SyncState>(File.ReadAllText(SyncStatePath, Encoding.UTF8)) ?? new SyncState();
     } catch (Exception ex) { Log("sync state", ex); syncState = new SyncState(); }
@@ -323,6 +328,9 @@ internal sealed partial class ClipPanel {
 
   void AddSyncMenu(ContextMenuStrip menu) {
     menu.Items.Add("Sincronización en la nube…", null, (s, e) => ShowSyncDialog());
+    var live = new ToolStripMenuItem("Compartir lo copiado con el móvil", null, (s, e) => SetLiveEnabled(!LiveEnabled));
+    menu.Items.Add(live);
+    menu.Opening += (s, e) => { live.Enabled = syncCfg != null; live.Checked = LiveEnabled; };
     var now = new ToolStripMenuItem("Sincronizar ahora", null, (s, e) => { syncManual = true; StartSync(); });
     menu.Items.Add(now);
     var status = new ToolStripMenuItem { Enabled = false };
@@ -481,11 +489,12 @@ internal sealed partial class ClipPanel {
         using (var resp = (HttpWebResponse)r.GetResponse())
         using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8)) {
           delay = 5000;
-          PostToUi(() => { if (gen == syncGeneration) StartSync(); }); // reconciliar tras (re)conectar
+          PostToUi(() => { if (gen == syncGeneration) { StartSync(); StartLivePull(gen); } }); // reconciliar tras (re)conectar
           string evt = null, line;
           while (gen == syncGeneration && (line = reader.ReadLine()) != null) {
             if (line.StartsWith("event:")) evt = line.Substring(6).Trim();
             else if (line.StartsWith("data:") && evt == "changed") { var tag = line.Substring(5).Trim(); PostToUi(() => OnRemoteChanged(gen, tag)); }
+            else if (line.StartsWith("data:") && evt == "live") PostToUi(() => StartLivePull(gen));
             else if (line.Length == 0) evt = null;
           }
         }
@@ -518,6 +527,103 @@ internal sealed partial class ClipPanel {
         UseSyncConfig(dlg.Result);
       } catch (Exception ex) { Log("sync setup", ex); Notify("No se pudo guardar la configuración: " + ex.Message); }
     }
+  }
+}
+
+// ---------- «Lo último copiado» entre equipos (/v1/clipboard/live) ----------
+// Cada texto copiado aquí se sube cifrado; lo que otro equipo (p. ej. el móvil) sube llega por SSE y se pone en el portapapeles.
+internal sealed partial class ClipPanel {
+  static readonly string LiveOffPath = Path.Combine(Store, "live-off");
+  readonly WinTimer liveDebounce = new WinTimer { Interval = 400 };
+  string livePendingText;
+  bool livePushing, livePulling, livePullAgain;
+
+  bool LiveEnabled { get { return !File.Exists(LiveOffPath); } }
+
+  void SetLiveEnabled(bool on) {
+    try { if (on) File.Delete(LiveOffPath); else File.WriteAllText(LiveOffPath, ""); } catch (Exception ex) { Log("live toggle", ex); }
+  }
+
+  static string TextHash(string text) {
+    using (var sha = SHA256.Create()) return Convert.ToBase64String(sha.ComputeHash(Encoding.UTF8.GetBytes(text ?? "")));
+  }
+
+  // Llamado al copiar texto (o elegirlo en el panel).
+  void LiveCopied(string text) {
+    if (syncCfg == null || String.IsNullOrEmpty(text) || !LiveEnabled) return;
+    if (TextHash(text) == syncState.liveHash) return; // es lo que acaba de llegar o ya se envió
+    livePendingText = text;
+    liveDebounce.Stop(); liveDebounce.Start();
+  }
+
+  void StartLivePush() {
+    if (livePushing || livePendingText == null || syncCfg == null) return;
+    var text = livePendingText; livePendingText = null;
+    var cfg = syncCfg; var key = syncKey; int gen = syncGeneration;
+    var id = Guid.NewGuid().ToString("N");
+    livePushing = true;
+    ThreadPool.QueueUserWorkItem(_ => {
+      string etag = null; Exception err = null;
+      try {
+        var doc = new Dictionary<string, object> { { "v", 1 }, { "id", id }, { "kind", "text" }, { "text", text }, { "time", NowMs() }, { "from", Environment.MachineName } };
+        var body = SyncCrypto.Encrypt(key, Encoding.UTF8.GetBytes(new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(doc)));
+        if (body.Length > SyncEngine.MaxBlob) throw new SyncException("El texto copiado es demasiado grande para enviarlo.");
+        var r = SyncEngine.Send(cfg, "PUT", SyncEngine.LivePath, body, null, null);
+        if (r.Status != 200 && r.Status != 201) throw SyncEngine.Unexpected(r, "Al enviar lo copiado");
+        etag = r.ETag;
+      } catch (Exception ex) { err = ex; }
+      PostToUi(() => {
+        livePushing = false;
+        if (gen != syncGeneration) return;
+        if (err != null) { if (err is SyncException) LogLine("live", err.Message); else Log("live", err); }
+        else { syncState.liveId = id; syncState.liveHash = TextHash(text); syncState.liveEtag = etag; SaveSyncState(); }
+        if (livePendingText != null) StartLivePush();
+      });
+    });
+  }
+
+  void StartLivePull(int gen) {
+    if (syncCfg == null || gen != syncGeneration) return;
+    if (livePulling) { livePullAgain = true; return; }
+    livePulling = true; livePullAgain = false;
+    var cfg = syncCfg; var key = syncKey; var etag = syncState.liveEtag;
+    ThreadPool.QueueUserWorkItem(_ => {
+      Dictionary<string, object> doc = null; string newTag = null; Exception err = null;
+      try {
+        var r = SyncEngine.Send(cfg, "GET", SyncEngine.LivePath, null, null, etag);
+        if (r.Status == 200) {
+          newTag = r.ETag;
+          doc = new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Deserialize<Dictionary<string, object>>(Encoding.UTF8.GetString(SyncCrypto.Decrypt(key, r.Body)));
+        } else if (r.Status != 304 && r.Status != 404) throw SyncEngine.Unexpected(r, "Al recibir lo copiado");
+      } catch (Exception ex) { err = ex; }
+      PostToUi(() => {
+        livePulling = false;
+        if (gen != syncGeneration) return;
+        if (err != null) { if (err is SyncException) LogLine("live", err.Message); else Log("live", err); }
+        else if (doc != null) ApplyLive(doc, newTag);
+        if (livePullAgain) StartLivePull(gen);
+      });
+    });
+  }
+
+  void ApplyLive(Dictionary<string, object> doc, string etag) {
+    object o;
+    string id = doc.TryGetValue("id", out o) ? o as string : null;
+    string from = doc.TryGetValue("from", out o) ? o as string : null;
+    string kind = doc.TryGetValue("kind", out o) ? o as string : null;
+    string text = doc.TryGetValue("text", out o) ? o as string : null;
+    bool first = syncState.liveId == null && syncState.liveEtag == null; // recién configurado: no pisar el portapapeles con algo antiguo
+    syncState.liveEtag = etag;
+    if (id == null || id == syncState.liveId || from == Environment.MachineName || first || kind != "text" || String.IsNullOrEmpty(text) || !LiveEnabled) {
+      if (id != null) syncState.liveId = id;
+      SaveSyncState();
+      return;
+    }
+    syncState.liveId = id; syncState.liveHash = TextHash(text); SaveSyncState();
+    try {
+      Clipboard.SetDataObject(new DataObject(DataFormats.UnicodeText, text), true, 10, 50); // entra en el historial como cualquier copia
+      Info("Copiado desde " + (from ?? "otro equipo") + ".");
+    } catch (Exception ex) { Log("live apply", ex); }
   }
 }
 
