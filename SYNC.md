@@ -3,7 +3,7 @@
 EasyClipboard puede sincronizar los **elementos fijados** entre varios equipos Windows a través de **ClipboardSecretServer**, un servidor propio y pequeño que solo guarda un blob cifrado. El servidor nunca ve el contenido.
 
 - Se sincronizan los fijados de **texto** e **imagen** (hasta 2 MB por imagen). Los temporales y los fijados de tipo «archivos» (rutas locales) no salen del equipo.
-- Además, **lo último copiado** (texto) se comparte entre todos los equipos, incluido el móvil Android (ver §6).
+- Además, **lo último copiado** (texto o imagen PNG de hasta 2 MB) se comparte entre todos los equipos, incluido el móvil Android (ver §6).
 - El portapapeles funciona igual sin conexión; la sincronización es un añadido.
 
 ## 1. Cómo funciona

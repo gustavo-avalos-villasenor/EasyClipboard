@@ -535,7 +535,6 @@ internal sealed partial class ClipPanel {
 internal sealed partial class ClipPanel {
   static readonly string LiveOffPath = Path.Combine(Store, "live-off");
   readonly WinTimer liveDebounce = new WinTimer { Interval = 400 };
-  string livePendingText;
   bool livePushing, livePulling, livePullAgain;
 
   bool LiveEnabled { get { return !File.Exists(LiveOffPath); } }
@@ -547,27 +546,67 @@ internal sealed partial class ClipPanel {
   static string TextHash(string text) {
     using (var sha = SHA256.Create()) return Convert.ToBase64String(sha.ComputeHash(Encoding.UTF8.GetBytes(text ?? "")));
   }
+  static string PngHash(byte[] png) {
+    using (var sha = SHA256.Create()) return "img:" + Convert.ToBase64String(sha.ComputeHash(png));
+  }
+
+  // Pendiente de subir: texto o imagen (PNG), lo último gana.
+  sealed class LivePending { public string kind, text, hash; public byte[] png; }
+  LivePending livePending;
+  uint liveAppliedSeq; // secuencia del portapapeles de la última imagen recibida: no se reenvía aunque Windows cambie sus bytes
 
   // Llamado al copiar texto (o elegirlo en el panel).
   void LiveCopied(string text) {
     if (syncCfg == null || String.IsNullOrEmpty(text) || !LiveEnabled) return;
-    if (TextHash(text) == syncState.liveHash) return; // es lo que acaba de llegar o ya se envió
-    livePendingText = text;
+    QueueLive(new LivePending { kind = "text", text = text, hash = TextHash(text) });
+  }
+
+  // Llamado al copiar una imagen (o elegirla en el panel). Se envía como PNG de hasta 2 MB (se reduce si hace falta).
+  void LiveCopiedImage(byte[] png) {
+    if (syncCfg == null || png == null || png.Length == 0 || !LiveEnabled) return;
+    QueueLive(new LivePending { kind = "image", png = png, hash = PngHash(png) });
+  }
+
+  // Reduce la resolución hasta que el PNG quepa en 2 MB (capturas de pantallas 2K/4K). Corre fuera del hilo de la interfaz.
+  static byte[] FitPng(byte[] png) {
+    if (png.Length <= SyncEngine.MaxImage) return png;
+    using (var ms = new MemoryStream(png)) using (var src = Image.FromStream(ms)) {
+      double f = Math.Sqrt((double)SyncEngine.MaxImage / png.Length) * 0.9;
+      for (int i = 0; i < 8; i++, f *= 0.8) {
+        int w = Math.Max(1, (int)(src.Width * f)), h = Math.Max(1, (int)(src.Height * f));
+        using (var bmp = new Bitmap(w, h))
+        using (var g = Graphics.FromImage(bmp)) {
+          g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+          g.DrawImage(src, 0, 0, w, h);
+          using (var outMs = new MemoryStream()) {
+            bmp.Save(outMs, System.Drawing.Imaging.ImageFormat.Png);
+            if (outMs.Length <= SyncEngine.MaxImage) return outMs.ToArray();
+          }
+        }
+      }
+    }
+    throw new SyncException("No se pudo reducir la imagen a 2 MB.");
+  }
+
+  void QueueLive(LivePending p) {
+    if (p.hash == syncState.liveHash) return; // es lo que acaba de llegar o ya se envió
+    livePending = p;
     liveDebounce.Stop(); liveDebounce.Start();
   }
 
   void StartLivePush() {
-    if (livePushing || livePendingText == null || syncCfg == null) return;
-    var text = livePendingText; livePendingText = null;
+    if (livePushing || livePending == null || syncCfg == null) return;
+    var p = livePending; livePending = null;
     var cfg = syncCfg; var key = syncKey; int gen = syncGeneration;
     var id = Guid.NewGuid().ToString("N");
     livePushing = true;
     ThreadPool.QueueUserWorkItem(_ => {
       string etag = null; Exception err = null;
       try {
-        var doc = new Dictionary<string, object> { { "v", 1 }, { "id", id }, { "kind", "text" }, { "text", text }, { "time", NowMs() }, { "from", Environment.MachineName } };
+        var doc = new Dictionary<string, object> { { "v", 1 }, { "id", id }, { "kind", p.kind }, { "time", NowMs() }, { "from", Environment.MachineName } };
+        if (p.kind == "image") doc["png"] = Convert.ToBase64String(FitPng(p.png)); else doc["text"] = p.text;
         var body = SyncCrypto.Encrypt(key, Encoding.UTF8.GetBytes(new JavaScriptSerializer { MaxJsonLength = int.MaxValue }.Serialize(doc)));
-        if (body.Length > SyncEngine.MaxBlob) throw new SyncException("El texto copiado es demasiado grande para enviarlo.");
+        if (body.Length > SyncEngine.MaxBlob) throw new SyncException("Lo copiado es demasiado grande para enviarlo.");
         var r = SyncEngine.Send(cfg, "PUT", SyncEngine.LivePath, body, null, null);
         if (r.Status != 200 && r.Status != 201) throw SyncEngine.Unexpected(r, "Al enviar lo copiado");
         etag = r.ETag;
@@ -576,8 +615,8 @@ internal sealed partial class ClipPanel {
         livePushing = false;
         if (gen != syncGeneration) return;
         if (err != null) { if (err is SyncException) LogLine("live", err.Message); else Log("live", err); }
-        else { syncState.liveId = id; syncState.liveHash = TextHash(text); syncState.liveEtag = etag; SaveSyncState(); }
-        if (livePendingText != null) StartLivePush();
+        else { syncState.liveId = id; syncState.liveHash = p.hash; syncState.liveEtag = etag; SaveSyncState(); }
+        if (livePending != null) StartLivePush();
       });
     });
   }
@@ -612,18 +651,31 @@ internal sealed partial class ClipPanel {
     string from = doc.TryGetValue("from", out o) ? o as string : null;
     string kind = doc.TryGetValue("kind", out o) ? o as string : null;
     string text = doc.TryGetValue("text", out o) ? o as string : null;
+    byte[] png = null;
+    if (kind == "image" && doc.TryGetValue("png", out o) && o is string) try { png = Convert.FromBase64String((string)o); } catch { png = null; }
+    bool usable = kind == "text" ? !String.IsNullOrEmpty(text) : kind == "image" && png != null && png.Length > 0;
     bool first = syncState.liveId == null && syncState.liveEtag == null; // recién configurado: no pisar el portapapeles con algo antiguo
     syncState.liveEtag = etag;
-    if (id == null || id == syncState.liveId || from == Environment.MachineName || first || kind != "text" || String.IsNullOrEmpty(text) || !LiveEnabled) {
+    if (id == null || id == syncState.liveId || from == Environment.MachineName || first || !usable || !LiveEnabled) {
       if (id != null) syncState.liveId = id;
       SaveSyncState();
       return;
     }
-    syncState.liveId = id; syncState.liveHash = TextHash(text); SaveSyncState();
+    syncState.liveId = id; syncState.liveHash = kind == "image" ? PngHash(png) : TextHash(text); SaveSyncState();
+    Bitmap bitmap = null;
     try {
-      Clipboard.SetDataObject(new DataObject(DataFormats.UnicodeText, text), true, 10, 50); // entra en el historial como cualquier copia
-      Info("Copiado desde " + (from ?? "otro equipo") + ".");
+      DataObject data;
+      if (kind == "image") {
+        data = new DataObject();
+        data.SetData("PNG", false, new MemoryStream(png)); // se captura con estos mismos bytes: no se reenvía
+        using (var ms = new MemoryStream(png)) using (var img = Image.FromStream(ms)) bitmap = new Bitmap(img);
+        data.SetImage(bitmap);
+      } else data = new DataObject(DataFormats.UnicodeText, text);
+      Clipboard.SetDataObject(data, true, 10, 50); // entra en el historial como cualquier copia
+      if (kind == "image") liveAppliedSeq = Native.GetClipboardSequenceNumber();
+      Info((kind == "image" ? "Imagen copiada desde " : "Copiado desde ") + (from ?? "otro equipo") + ".");
     } catch (Exception ex) { Log("live apply", ex); }
+    finally { if (bitmap != null) bitmap.Dispose(); }
   }
 }
 

@@ -547,6 +547,7 @@ internal sealed partial class ClipPanel : Form {
       }
       MarkDirty(); RefreshList(null);
       if (item.kind == "text") LiveCopied(item.text);
+      else if (item.kind == "image" && seq != liveAppliedSeq) LiveCopiedImage(png);
     } catch (Exception ex) { Log("store", ex); }
   }
 
@@ -821,13 +822,13 @@ internal sealed partial class ClipPanel : Form {
   }
 
   bool PutOnClipboard(ClipItem it) {
-    Bitmap bitmap = null;
+    Bitmap bitmap = null; byte[] livePng = null;
     try {
       var data = new DataObject();
       if (it.kind == "image") {
         var path = Path.Combine(Store, it.imageFile ?? "");
         if (!File.Exists(path)) { Notify("La imagen ya no está en panel-data."); return false; }
-        var bytes = File.ReadAllBytes(path);
+        var bytes = File.ReadAllBytes(path); livePng = bytes;
         data.SetData("PNG", false, new MemoryStream(bytes));
         using (var ms = new MemoryStream(bytes)) using (var img = Image.FromStream(ms)) bitmap = new Bitmap(img);
         data.SetImage(bitmap);
@@ -844,6 +845,7 @@ internal sealed partial class ClipPanel : Form {
       Clipboard.SetDataObject(data, true, 10, 50);
       ownSequence = Native.GetClipboardSequenceNumber();
       if (it.kind == "text") LiveCopied(it.text);
+      else if (livePng != null) LiveCopiedImage(livePng);
       it.time = DateTimeOffset.Now.ToUnixTimeMilliseconds();
       MarkDirty();
       return true;
